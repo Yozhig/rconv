@@ -1,0 +1,14 @@
+{application, rconv, [
+    {description, "Parse transform for record to map and map to record conversions"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {applications, [
+        kernel,
+        stdlib
+    ]},
+    {env, []},
+    {modules, [rconv]},
+
+    {licenses, ["MIT License"]},
+    {links, ["https://github.com/Yozhig/rconv"]}
+]}.
