@@ -9,7 +9,7 @@ Usage
 Add dependency to your rebar.config
 ```erlang
     {deps, [
-        {rconv, {git, "git@github.com:Yozhig/rconv.git", {tag, "0.1.0"}}},
+        {rconv, {git, "https://github.com/Yozhig/rconv.git", {tag, "0.1.0"}}},
     ]}
 ```
 and compile option for parse transform at the top of the source file
