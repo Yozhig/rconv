@@ -6,21 +6,12 @@
     from_map/2
 ]).
 
--export([parse_transform/2]).
+-export([
+    parse_transform/2,
+    format_error/1
+]).
 
--type record_name() :: atom().
--type field_name() :: atom().
-% type of a default value may differ from declared field type
-% we only need to know the type of a default value to properly construct a record
--type default_value_type() :: atom().
--type default_value() :: term().
-
--record(state, {
-    records = #{} :: #{record_name() => [{field_name(), default_value_type(), default_value()}]}
-}).
-
-% -define(log(F, A), io:format(standard_error, "~n=======~n" F "~n=======~n", A)).
--define(log(F, A), ok).
+%% API stubs
 
 %% @doc Constructs a map from a provided record.
 -spec to_map(tuple(), atom()) -> map().
@@ -43,10 +34,40 @@ to_clean_map(_Record, _RecordName, _FilterFun) ->
 from_map(_Map, _RecordName) ->
     erlang:nif_error(<<"Add `-compile([{parse_transform, rconv}]).` to your module">>).
 
+%%     _____                    __
+%%    |_   _|                  / _|
+%%      | |_ __ __ _ _ __  ___| |_ ___  _ __ _ __ ___
+%%      | | '__/ _` | '_ \/ __|  _/ _ \| '__| '_ ` _ \
+%%      | | | | (_| | | | \__ \ || (_) | |  | | | | | |
+%%      \_/_|  \__,_|_| |_|___/_| \___/|_|  |_| |_| |_|
+%%
+
+-type record_name() :: atom().
+-type field_name() :: atom().
+% type of a default value may differ from declared field type
+% we only need to know the type of a default value to properly construct a record
+-type default_value_type() :: atom().
+-type default_value() :: term().
+
+-record(state, {
+    records = #{} :: #{record_name() => [{field_name(), default_value_type(), default_value()}]},
+    errors = [] :: [{error, erl_parse:error_info()}]
+}).
+
+% -define(log(F, A), io:format(standard_error, "~n=======~n" F "~n=======~n", A)).
+-define(log(F, A), ok).
+
 parse_transform(Ast, _Opts) ->
-    % ?log("Ast: ~n~p", [Ast]),
-    {NewAst, _} = traverse(fun search_and_replace/2, #state{}, Ast),
-    NewAst.
+    ?log("Ast: ~n~p", [Ast]),
+    {NewAst, #state{errors = Errors}} = traverse(fun search_and_replace/2, #state{}, Ast),
+    Errors ++ NewAst.
+
+format_error({record_not_found, RecName}) ->
+    io_lib:format("record '~p' not found", [RecName]);
+format_error(bad_record_name) ->
+    "record name argument should be an atom".
+
+%% Internals
 
 traverse(Fun, State, List) when is_list(List) ->
     lists:mapfoldl(
@@ -75,14 +96,11 @@ search_and_replace(
 search_and_replace( % map construction
     {call, Loc,
         {remote, _, {atom, _, ?MODULE}, {atom, _, to_map}},
-        [RecVal, {atom, _, RecName}]} = Node,
-    #state{records = Records} = St
+        [RecVal, RecNameArg]} = AsIs,
+    State
 ) ->
-    case maps:get(RecName, Records, undefined) of
-        undefined -> % FIXME: emit error at compile time
-            ?log("WARNING: ~p not found", [RecName]),
-            {Node, St};
-        Fields ->
+    case check_record(Loc, RecNameArg, State) of
+        {ok, RecName, Fields} ->
             MapFields = [
                 {map_field_assoc,
                     Loc,
@@ -95,37 +113,34 @@ search_and_replace( % map construction
                 || {F, _Type, _DefValue} <- Fields
             ],
             MapExpr = {map, Loc, MapFields},
-            {MapExpr, St}
+            {MapExpr, State};
+        {error, NewState} ->
+            {AsIs, NewState}
     end;
 search_and_replace( % clean (filtered) map
     {call, Loc,
         {remote, _, {atom, _, ?MODULE}, {atom, _, to_clean_map}},
-        [RecVal, RecNameAtom, FilterFun]} = Node,
-    #state{records = Records} = St
+        [RecVal, RecNameArg, FilterFun]} = AsIs,
+    State
 ) ->
-    {atom, _, RecName} = RecNameAtom,
-    case maps:get(RecName, Records, undefined) of
-        undefined -> % FIXME: emit error at compile time
-            ?log("WARNING: ~p not found", [RecName]),
-            {Node, St};
-        Fields ->
+    case check_record(Loc, RecNameArg, State) of
+        {ok, RecName, Fields} ->
             MapFromList =
                 {call, Loc,
                     {remote, Loc, {atom, Loc, maps}, {atom, Loc, from_list}},
                     [plus(Fields, RecVal, RecName, Loc, FilterFun)]},
-            {MapFromList, St}
+            {MapFromList, State};
+        {error, NewState} ->
+            {AsIs, NewState}
     end;
 search_and_replace( % record construction
     {call, Loc,
         {remote, _, {atom, _, ?MODULE}, {atom, _, from_map}},
-        [MapVal, {atom, _, RecName}]} = Node,
-    #state{records = Records} = St
+        [MapVal, RecNameArg]} = AsIs,
+    State
 ) ->
-    case maps:get(RecName, Records, undefined) of
-        undefined -> % FIXME: emit error at compile time
-            ?log("WARNING: ~p not found", [RecName]),
-            {Node, St};
-        Fields ->
+    case check_record(Loc, RecNameArg, State) of
+        {ok, RecName, Fields} ->
             RecordFields = [
                 {record_field,
                     Loc,
@@ -138,7 +153,9 @@ search_and_replace( % record construction
                 || {F, Type, DefValue} <- Fields
             ],
             RecordExpr = {record, Loc, RecName, RecordFields},
-            {RecordExpr, St}
+            {RecordExpr, State};
+        {error, NewState} ->
+            {AsIs, NewState}
     end;
 search_and_replace(Node, St) ->
     {Node, St}.
@@ -169,3 +186,21 @@ lc({FieldName, _Type, _DefValue}, RecVal, RecName, Loc, FilterFun) ->
             {record_field, Loc, RecVal, RecName, {atom, Loc, FieldName}}
         ]}]
     }.
+
+check_record(_Loc, {atom, RecNameLoc, RecName}, #state{records = Records} = St) ->
+    case maps:get(RecName, Records, undefined) of
+        undefined ->
+            {error, not_found(RecName, RecNameLoc, St)};
+        Fields ->
+            {ok, RecName, Fields}
+    end;
+check_record(Loc, _, St) ->
+    {error, bad_record_name(Loc, St)}.
+
+not_found(RecName, Loc, #state{errors = Errors} = St) ->
+    Error = {error, {Loc, ?MODULE, {record_not_found, RecName}}},
+    St#state{errors = [Error | Errors]}.
+
+bad_record_name(Loc, #state{errors = Errors} = St) ->
+    Error = {error, {Loc, ?MODULE, bad_record_name}},
+    St#state{errors = [Error | Errors]}.
